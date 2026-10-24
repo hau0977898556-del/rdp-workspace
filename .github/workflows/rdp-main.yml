@@ -95,9 +95,6 @@ jobs:
             try {
               $srvResp = Invoke-RestMethod -Uri "https://localtonet.com/api/v2/servers" -Headers @{ Authorization = "Bearer $apiKey" } -TimeoutSec 15 -ErrorAction Stop
               
-              # Debug: show raw response type and first item
-              Write-Host "  API response type: $($srvResp.GetType().Name)"
-              
               $serverList = @()
               if ($srvResp -is [array]) {
                 $serverList = @($srvResp)
@@ -108,24 +105,17 @@ jobs:
               }
               
               Write-Host "  Found $($serverList.Count) servers"
-              if ($serverList.Count -gt 0) {
-                $first = $serverList[0]
-                Write-Host "  First server raw: $($first | ConvertTo-Json -Compress)"
-                Write-Host "  First server: code=$($first.serverCode) name=$($first.serverName) domain=$($first.serverDomain)"
-              }
               
               if ($serverList.Count -gt 0) {
-                # Prefer US servers
                 $usServers = @($serverList | Where-Object { $_.serverName -like "*US*" -or $_.serverCode -like "*us*" })
                 if ($usServers.Count -gt 0) {
                   $serverCode = $usServers[0].serverCode
                   $serverDomain = $usServers[0].serverDomain
-                  Write-Host "  Selected US server: $($usServers[0].serverName) ($serverCode) domain=$serverDomain"
                 } else {
                   $serverCode = $serverList[0].serverCode
                   $serverDomain = $serverList[0].serverDomain
-                  Write-Host "  Selected first server: $($serverList[0].serverName) ($serverCode) domain=$serverDomain"
                 }
+                Write-Host "  Selected server: $serverCode domain=$serverDomain"
               }
               break
             } catch {
@@ -156,11 +146,9 @@ jobs:
               } | ConvertTo-Json -Depth 5
 
               $tunnelResp = Invoke-RestMethod -Method POST -Uri "https://localtonet.com/api/v2/tunnels/tcp-udp" -Headers @{ Authorization = "Bearer $apiKey"; "Content-Type" = "application/json" } -Body $body -TimeoutSec 15 -ErrorAction Stop
-              Write-Host "  Tunnel creation response: $($tunnelResp | ConvertTo-Json -Depth 5 -Compress)"
-
               if ($tunnelResp.id) {
                 $tunnelId = $tunnelResp.id
-                Write-Host "  Tunnel created! ID: $tunnelId, ServerIP: $($tunnelResp.serverIp), ServerPort: $($tunnelResp.serverPort), Domain: $($tunnelResp.serverDomain)"
+                Write-Host "  Tunnel created! ID: $tunnelId"
                 break
               }
             } catch {
@@ -175,7 +163,6 @@ jobs:
           }
 
           # --- Download and Start localtonet client ---
-          # The CLI must be running to relay traffic, but we use API to manage the tunnel
           Write-Host "Downloading localtonet client..."
           $ltExe = "C:\Tools\localtonet.exe"
           if (-not (Test-Path $ltExe)) {
@@ -187,13 +174,10 @@ jobs:
             $downloaded = $false
             foreach ($url in $urls) {
               try {
-                Write-Host "  Trying download from: $url"
                 Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\localtonet.zip" -TimeoutSec 120
                 $downloaded = $true
                 break
-              } catch {
-                Write-Warning "  Download failed from $url"
-              }
+              } catch {}
             }
             if (-not $downloaded) { Write-Error "All localtonet download URLs failed"; exit 1 }
             Expand-Archive -Path "$env:TEMP\localtonet.zip" -DestinationPath "C:\Tools" -Force
@@ -202,37 +186,21 @@ jobs:
               $found = Get-ChildItem -Path "C:\Tools" -Filter "localtonet.exe" -Recurse | Select-Object -First 1
               if ($found) { Move-Item $found.FullName "C:\Tools\localtonet.exe" -Force }
             }
-            Write-Host "  Localtonet installed at $ltExe"
           }
 
-          # Start localtonet with authtoken - use Start-Process to avoid blocking
-          Write-Host "Starting localtonet client in background..."
           Start-Process -FilePath $ltExe -ArgumentList "--authtoken",$token -WindowStyle Hidden
           Start-Sleep -Seconds 10
 
-          # Verify localtonet is running
-          $ltProc = Get-Process -Name "localtonet" -ErrorAction SilentlyContinue
-          if ($ltProc) {
-            Write-Host "  Localtonet is running! PID: $($ltProc.Id)"
-          } else {
-            Write-Host "  WARNING: Localtonet process not detected, but tunnel may still work via API..."
-          }
-
-          # --- Start the tunnel via REST API ---
-          Write-Host "Starting tunnel ID: $tunnelId via Localtonet API..."
+          # Start tunnel via API
           for ($attempt = 1; $attempt -le 15; $attempt++) {
             try {
-              $startResp = Invoke-RestMethod -Method POST -Uri "https://localtonet.com/api/v2/tunnels/$tunnelId/actions/start" -Headers @{ Authorization = "Bearer $apiKey" } -TimeoutSec 15 -ErrorAction Stop
-              Write-Host "  Start tunnel response: $($startResp | ConvertTo-Json -Depth 5 -Compress)"
+              Invoke-RestMethod -Method POST -Uri "https://localtonet.com/api/v2/tunnels/$tunnelId/actions/start" -Headers @{ Authorization = "Bearer $apiKey" } -TimeoutSec 15 -ErrorAction Stop | Out-Null
               break
             } catch {
               $errMsg = $_.Exception.Message
-              Write-Host "  Attempt $attempt : Start tunnel error - $errMsg"
-              # If client not connected yet, restart it
               if ($errMsg -like "*Start or Update*" -or $errMsg -like "*localtonet app*") {
                 $ltProc = Get-Process -Name "localtonet" -ErrorAction SilentlyContinue
                 if (-not $ltProc) {
-                  Write-Host "  Restarting localtonet client..."
                   Start-Process -FilePath $ltExe -ArgumentList "--authtoken",$token -WindowStyle Hidden
                 }
                 Start-Sleep -Seconds 5
@@ -242,20 +210,14 @@ jobs:
             }
           }
 
-          # --- Poll for tunnel serverPort ---
-          Write-Host "Waiting for tunnel to become active..."
+          # Poll for tunnel serverPort
           for ($attempt = 1; $attempt -le 30; $attempt++) {
             Start-Sleep -Seconds 5
             try {
               $tunnelInfo = Invoke-RestMethod -Uri "https://localtonet.com/api/v2/tunnels/$tunnelId" -Headers @{ Authorization = "Bearer $apiKey" } -TimeoutSec 15 -ErrorAction Stop
-
               $sPort = $tunnelInfo.serverPort
               $sIp = $tunnelInfo.serverIp
               $sDomain = $tunnelInfo.serverDomain
-              $connStatus = $tunnelInfo.connectionStatus
-              $status = $tunnelInfo.status
-
-              Write-Host "  Attempt $attempt : status=$status conn=$connStatus ip=$sIp port=$sPort domain=$sDomain"
 
               if ($sPort -and $sPort -gt 0) {
                 if ($sDomain) {
@@ -266,23 +228,13 @@ jobs:
                 Write-Host "  SUCCESS! Tunnel URL: $publicUrl"
                 break
               }
-
-              # Retry start if needed
-              if ($status -eq 0 -and $attempt -gt 3) {
-                try {
-                  Invoke-RestMethod -Method POST -Uri "https://localtonet.com/api/v2/tunnels/$tunnelId/actions/start" -Headers @{ Authorization = "Bearer $apiKey" } -TimeoutSec 15 -ErrorAction Stop | Out-Null
-                } catch {}
-              }
-            } catch {
-              Write-Host "  Attempt $attempt : API error - $($_.Exception.Message)"
-            }
+            } catch {}
           }
 
           if ($publicUrl) {
             "LOCALTONET_URL=$publicUrl" | Out-File -Append $env:GITHUB_ENV
             "TUNNEL_URL=$publicUrl" | Out-File -Append $env:GITHUB_ENV
             "LOCALTONET_TUNNEL_ID=$tunnelId" | Out-File -Append $env:GITHUB_ENV
-            Write-Host "Localtonet RDP Tunnel established: $publicUrl"
           } else {
             Write-Error "FAILED: Could not get Localtonet tunnel URL after all attempts."
             exit 1
@@ -305,7 +257,6 @@ jobs:
 
       - name: Enable RDP user + firewall
         run: |
-          # Disable password complexity so any password works
           $secFile = "$env:TEMP\secedit.cfg"
           $secNew = "$env:TEMP\secedit_new.cfg"
           secedit /export /cfg $secFile /quiet 2>$null
@@ -329,9 +280,8 @@ jobs:
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
           Write-Host "RDP ready. user=$u pass=$p host=$env:RDP_HOSTNAME"
-          Write-Host "Tunnel URL: $env:TUNNEL_URL"
 
-      # --- Remove bloatware (Unity Hub, etc.) ---
+      # --- Remove bloatware ---
       - name: Remove Unity Hub and bloatware
         run: |
           $uh = Get-ItemProperty "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*" -EA SilentlyContinue |
@@ -339,7 +289,6 @@ jobs:
           if ($uh) {
             $uninst = $uh.UninstallString
             if ($uninst) {
-              Write-Host "[+] Uninstalling Unity Hub..."
               Start-Process cmd -ArgumentList "/c",$uninst,"/S","--force-run" -Wait -NoNewWindow -EA SilentlyContinue
             }
           }
@@ -353,25 +302,51 @@ jobs:
             "$env:LOCALAPPDATA\Programs\Unity Hub"
           )
           foreach ($p in $uhPaths) {
-            if (Test-Path $p) {
-              Write-Host "[+] Removing $p"
-              Remove-Item $p -Recurse -Force -EA SilentlyContinue
-            }
-          }
-          $suPaths = @(
-            "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run",
-            "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run"
-          )
-          foreach ($reg in $suPaths) {
-            $val = Get-ItemProperty $reg -EA SilentlyContinue
-            if ($val.'Unity Hub') {
-              Remove-ItemProperty $reg -Name 'Unity Hub' -Force -EA SilentlyContinue
-              Write-Host "[+] Removed Unity Hub from startup"
-            }
+            if (Test-Path $p) { Remove-Item $p -Recurse -Force -EA SilentlyContinue }
           }
           Remove-Item "$env:PUBLIC\Desktop\Unity Hub.lnk" -Force -EA SilentlyContinue
           Remove-Item "$env:USERPROFILE\Desktop\Unity Hub.lnk" -Force -EA SilentlyContinue
-          Write-Host "[+] Unity Hub cleanup done"
+
+      # --- 📦 TỰ ĐỘNG CÀI ĐẶT VS CODE VÀ DISCORD ---
+      - name: 📦 Auto install Discord & VS Code
+        run: |
+          Write-Host "========================================"
+          Write-Host "  CÀI ĐẶT VISUAL STUDIO CODE & DISCORD"
+          Write-Host "========================================"
+
+          # 1. Cài đặt Visual Studio Code (System Installer 64-bit cho mọi User)
+          Write-Host "[+] Đang tải VS Code Installer..."
+          $vscodeUrl = "https://update.code.visualstudio.com/latest/win32-x64/stable"
+          $vscodeInstaller = "$env:TEMP\VSCodeSetup.exe"
+          try {
+            Invoke-WebRequest -Uri $vscodeUrl -OutFile $vscodeInstaller -TimeoutSec 120
+            Write-Host "[+] Đang cài đặt VS Code ngầm..."
+            Start-Process -FilePath $vscodeInstaller -ArgumentList "/verysilent /norestart /MERGETASKS=!runcode,addtopath,desktopicon" -Wait
+            Write-Host "  ✅ Visual Studio Code đã cài đặt thành công!"
+          } catch {
+            Write-Warning "  ⚠️ Cài đặt VS Code thất bại: $($_.Exception.Message)"
+          }
+
+          # 2. Cài đặt Discord
+          Write-Host "[+] Đang tải Discord Installer..."
+          $discordUrl = "https://discord.com/api/download?platform=win"
+          $discordInstaller = "$env:TEMP\DiscordSetup.exe"
+          try {
+            Invoke-WebRequest -Uri $discordUrl -OutFile $discordInstaller -TimeoutSec 120
+            Write-Host "[+] Đang cài đặt Discord ngầm..."
+            Start-Process -FilePath $discordInstaller -ArgumentList "-s" -Wait
+            Start-Sleep -Seconds 5
+            
+            # Đảm bảo icon Discord xuất hiện trên Desktop của user Kandagawa
+            $discordLnks = Get-ChildItem -Path "$env:USERPROFILE" -Filter "*Discord*.lnk" -Recurse -ErrorAction SilentlyContinue
+            foreach ($lnk in $discordLnks) {
+              Copy-Item $lnk.FullName "C:\Users\Public\Desktop\" -Force -ErrorAction SilentlyContinue
+            }
+            Write-Host "  ✅ Discord đã cài đặt thành công!"
+          } catch {
+            Write-Warning "  ⚠️ Cài đặt Discord thất bại: $($_.Exception.Message)"
+          }
+          Write-Host "========================================"
 
       - name: Print connection info
         run: |
@@ -379,63 +354,47 @@ jobs:
           Write-Host "========================================"
           Write-Host "  KANDA RDP - CONNECTION INFO"
           Write-Host "========================================"
-          Write-Host ""
-          if ($env:TUNNEL_URL) {
-            Write-Host "  Tunnel TCP   : $env:TUNNEL_URL"
-          }
+          Write-Host "  Tunnel TCP   : $env:TUNNEL_URL"
           Write-Host "  RDP User     : $env:RDP_USER"
           Write-Host "  RDP Pass     : $env:RDP_PASS"
           Write-Host "  Runtime      : $env:RUNTIME_MINUTES min"
-          Write-Host ""
           Write-Host "========================================"
-          Write-Host ""
 
-          # Write to GITHUB_STEP_SUMMARY
-          $summary = @()
-          $summary += "## KANDA RDP - CONNECTION INFO"
-          $summary += ""
-          $summary += "========================================"
-          $summary += "  KANDA RDP - CONNECTION INFO"
-          $summary += "========================================"
-          if ($env:TUNNEL_URL) { $summary += "  Tunnel TCP   : $env:TUNNEL_URL" }
-          $summary += "  RDP User     : $env:RDP_USER"
-          $summary += "  RDP Pass     : $env:RDP_PASS"
-          $summary += "  Runtime      : $env:RUNTIME_MINUTES min"
-          $summary += "========================================"
-          $summary | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          # Save to connection-info.txt
+          $infoFileName = if ("${{ inputs.rdp_count }}" -gt 1) { "connection-info-${{ matrix.id }}.txt" } else { "connection-info.txt" }
+          "infoFileName=$infoFileName" | Out-File -Append $env:GITHUB_ENV
 
-          # Save connection info to file in repo
-          $infoLines = [System.Collections.ArrayList]@()
-          [void]$infoLines.Add("KANDA RDP - CONNECTION INFO")
-          [void]$infoLines.Add("========================================")
-          if ($env:TUNNEL_URL) { [void]$infoLines.Add("  Tunnel TCP   : $env:TUNNEL_URL") }
-          [void]$infoLines.Add("  RDP User     : $env:RDP_USER")
-          [void]$infoLines.Add("  RDP Pass     : $env:RDP_PASS")
-          [void]$infoLines.Add("  Runtime      : $env:RUNTIME_MINUTES min")
-          [void]$infoLines.Add("========================================")
-          $infoLines | Out-File -Encoding utf8 "connection-info.txt"
-          Write-Host "Connection info saved to connection-info.txt"
+          @(
+            "KANDA RDP - CONNECTION INFO",
+            "========================================",
+            "  Tunnel TCP   : $env:TUNNEL_URL",
+            "  RDP User     : $env:RDP_USER",
+            "  RDP Pass     : $env:RDP_PASS",
+            "  Runtime      : $env:RUNTIME_MINUTES min",
+            "========================================"
+          ) | Out-File -Encoding utf8 $infoFileName
 
       - name: Commit connection info to repo
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $content = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes("connection-info.txt"))
+          $file = $env:infoFileName
+          $content = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($file))
           $body = @{
-            message = "Update connection info"
+            message = "Update connection info ($file)"
             content = $content
             branch = "${{ github.ref_name }}"
           } | ConvertTo-Json -Depth 10
 
           $existingSha = $null
           try {
-            $existing = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ github.repository }}/contents/connection-info.txt?ref=${{ github.ref_name }}" -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" } -ErrorAction SilentlyContinue
+            $existing = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ github.repository }}/contents/$file?ref=${{ github.ref_name }}" -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" } -ErrorAction SilentlyContinue
             if ($existing.sha) { $existingSha = $existing.sha }
           } catch {}
 
           if ($existingSha) {
             $body = @{
-              message = "Update connection info"
+              message = "Update connection info ($file)"
               content = $content
               sha = $existingSha
               branch = "${{ github.ref_name }}"
@@ -443,82 +402,225 @@ jobs:
           }
 
           $hdr = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
-          $uri = "https://api.github.com/repos/${{ github.repository }}/contents/connection-info.txt"
+          $uri = "https://api.github.com/repos/${{ github.repository }}/contents/$file"
           try {
             Invoke-RestMethod -Method PUT -Uri $uri -Headers $hdr -Body $body -ContentType "application/json" | Out-Null
-            Write-Host "Connection info committed to repo successfully!"
+            Write-Host "Connection info committed ($file) successfully!"
           } catch {
             Write-Warning "Failed to commit connection info: $($_.Exception.Message)"
           }
 
-      - name: Keep alive (to ${{ env.RUNTIME_MINUTES }} mins)
+      # --- Keep alive + Auto Healthcheck & Re-request Tunnel mỗi 5 phút ---
+      - name: Keep alive (Auto check TCP link every 5m)
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $mins = [int]"${{ env.RUNTIME_MINUTES }}"
           $end = (Get-Date).AddMinutes($mins)
           $i = 0
+
+          $currentTunnelUrl = $env:TUNNEL_URL
+          $currentTunnelId  = $env:LOCALTONET_TUNNEL_ID
+          $apiKey           = "$env:LOCALTONET_API_KEY".Trim()
+          $token            = "$env:LOCALTONET_TOKEN".Trim()
+          $ltExe            = "C:\Tools\localtonet.exe"
+          $file             = $env:infoFileName
+
+          function Test-RdpHealth ($tcpUrl) {
+            if (-not $tcpUrl -or $tcpUrl -notmatch 'tcp://([^:]+):(\d+)') { return $false }
+            $hostName = $matches[1]
+            $port = [int]$matches[2]
+
+            try {
+              $client = New-Object System.Net.Sockets.TcpClient
+              $connect = $client.BeginConnect($hostName, $port, $null, $null)
+              $wait = $connect.AsyncWaitHandle.WaitOne(8000, $false)
+              if (-not $wait) { $client.Close(); return $false }
+              $client.EndConnect($connect)
+
+              $stream = $client.GetStream()
+              $stream.WriteTimeout = 5000
+              $stream.ReadTimeout = 5000
+
+              [byte[]]$rdpReq = 0x03,0x00,0x00,0x13,0x0E,0xE0,0x00,0x00,0x00,0x00,0x00,0x01,0x00,0x08,0x00,0x03,0x00,0x00,0x00
+              $stream.Write($rdpReq, 0, $rdpReq.Length)
+
+              [byte[]]$resp = New-Object byte[] 4
+              $read = $stream.Read($resp, 0, 4)
+              $client.Close()
+
+              if ($read -ge 4 -and $resp[0] -eq 3) {
+                return $true
+              }
+              return $false
+            } catch {
+              if ($client) { $client.Close() }
+              return $false
+            }
+          }
+
           while ((Get-Date) -lt $end) {
             $i++
 
-            # Ensure localtonet stays alive
             $ltProc = Get-Process -Name "localtonet" -ErrorAction SilentlyContinue
-            if (-not $ltProc) {
-              Write-Host "Localtonet died, restarting..."
-              $ltExe = "C:\Tools\localtonet.exe"
-              if (Test-Path $ltExe) {
-                Start-Process -FilePath $ltExe -WindowStyle Hidden
-              }
+            if (-not $ltProc -and (Test-Path $ltExe)) {
+              Write-Host "⚠️ Localtonet process died! Restarting..."
+              Start-Process -FilePath $ltExe -ArgumentList "--authtoken",$token -WindowStyle Hidden
+              Start-Sleep -Seconds 5
             }
 
-            $mode = '['
-            if ($env:TUNNEL_URL) { $mode += 'Tunnel+' }
-            $mode += 'RDP]'
+            # Kiểm tra RDP Health mỗi 5 phút
+            if ($i % 5 -eq 0) {
+              Write-Host ""
+              Write-Host "🔍 [Health Check #$($i/5)] Đang kiểm tra link TCP RDP ($currentTunnelUrl)..."
+              
+              $isHealthy = $false
+              for ($try = 1; $try -le 2; $try++) {
+                if (Test-RdpHealth -tcpUrl $currentTunnelUrl) {
+                  $isHealthy = $true
+                  break
+                }
+                Start-Sleep -Seconds 3
+              }
+
+              if ($isHealthy) {
+                Write-Host "  ✅ RDP Tunnel đang HOẠT ĐỘNG TỐT (Sẵn sàng nhận kết nối tài khoản/mật khẩu)."
+              } else {
+                Write-Host "  ❌ PHÁT HIỆN LINK HỎNG / KHÔNG PHẢN HỒI RDP! Đang yêu cầu cấp Tunnel mới..."
+
+                # 1. Xóa Tunnel cũ
+                if ($currentTunnelId) {
+                  Write-Host "  🗑️ Đang xóa tunnel cũ #$currentTunnelId..."
+                  try {
+                    Invoke-RestMethod -Method DELETE -Uri "https://localtonet.com/api/v2/tunnels/$currentTunnelId" -Headers @{ Authorization = "Bearer $apiKey" } -TimeoutSec 10 -ErrorAction SilentlyContinue | Out-Null
+                  } catch {}
+                }
+
+                # 2. Lấy Server mới
+                $newServerCode = $null
+                try {
+                  $srvResp = Invoke-RestMethod -Uri "https://localtonet.com/api/v2/servers" -Headers @{ Authorization = "Bearer $apiKey" } -TimeoutSec 15 -ErrorAction Stop
+                  $serverList = @()
+                  if ($srvResp -is [array]) { $serverList = @($srvResp) }
+                  elseif ($srvResp.data -and $srvResp.data -is [array]) { $serverList = @($srvResp.data) }
+                  elseif ($srvResp.serverCode) { $serverList = @($srvResp) }
+
+                  if ($serverList.Count -gt 0) {
+                    $usServers = @($serverList | Where-Object { $_.serverName -like "*US*" -or $_.serverCode -like "*us*" })
+                    if ($usServers.Count -gt 0) { $newServerCode = $usServers[0].serverCode } else { $newServerCode = $serverList[0].serverCode }
+                  }
+                } catch {}
+
+                # 3. Tạo Tunnel mới qua API
+                if ($newServerCode) {
+                  $newTunnelId = $null
+                  $newTunnelUrl = $null
+                  try {
+                    $body = @{
+                      authToken     = $token
+                      serverCode    = $newServerCode
+                      port          = 3389
+                      protocolType  = 3
+                      localServerIp = "127.0.0.1"
+                      ip            = "127.0.0.1"
+                    } | ConvertTo-Json -Depth 5
+
+                    $res = Invoke-RestMethod -Method POST -Uri "https://localtonet.com/api/v2/tunnels/tcp-udp" -Headers @{ Authorization = "Bearer $apiKey"; "Content-Type" = "application/json" } -Body $body -TimeoutSec 15 -ErrorAction Stop
+                    $newTunnelId = $res.id
+                  } catch {}
+
+                  if ($newTunnelId) {
+                    Get-Process -Name "localtonet" -ErrorAction SilentlyContinue | Stop-Process -Force
+                    Start-Sleep -Seconds 2
+                    Start-Process -FilePath $ltExe -ArgumentList "--authtoken",$token -WindowStyle Hidden
+                    Start-Sleep -Seconds 6
+
+                    try {
+                      Invoke-RestMethod -Method POST -Uri "https://localtonet.com/api/v2/tunnels/$newTunnelId/actions/start" -Headers @{ Authorization = "Bearer $apiKey" } -TimeoutSec 15 -ErrorAction Stop | Out-Null
+                    } catch {}
+
+                    for ($w = 1; $w -le 15; $w++) {
+                      Start-Sleep -Seconds 4
+                      try {
+                        $info = Invoke-RestMethod -Uri "https://localtonet.com/api/v2/tunnels/$newTunnelId" -Headers @{ Authorization = "Bearer $apiKey" } -TimeoutSec 15 -ErrorAction Stop
+                        if ($info.serverPort -and $info.serverPort -gt 0) {
+                          if ($info.serverDomain) { $newTunnelUrl = "tcp://$($info.serverDomain):$($info.serverPort)" }
+                          elseif ($info.serverIp) { $newTunnelUrl = "tcp://$($info.serverIp):$($info.serverPort)" }
+                          break
+                        }
+                      } catch {}
+                    }
+
+                    if ($newTunnelUrl) {
+                      $currentTunnelUrl = $newTunnelUrl
+                      $currentTunnelId  = $newTunnelId
+                      $env:TUNNEL_URL   = $newTunnelUrl
+                      Write-Host "  🎉 ĐÃ CẤP TUNNEL MỚI THÀNH CÔNG: $newTunnelUrl"
+
+                      # 4. Cập nhật và commit đè file lên GitHub
+                      @(
+                        "KANDA RDP - CONNECTION INFO (UPDATED)",
+                        "========================================",
+                        "  Tunnel TCP   : $newTunnelUrl",
+                        "  RDP User     : $env:RDP_USER",
+                        "  RDP Pass     : $env:RDP_PASS",
+                        "  Updated At   : $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))",
+                        "========================================"
+                      ) | Out-File -Encoding utf8 $file
+
+                      try {
+                        $content = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($file))
+                        $existingSha = $null
+                        try {
+                          $ex = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ github.repository }}/contents/$file?ref=${{ github.ref_name }}" -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" } -ErrorAction SilentlyContinue
+                          if ($ex.sha) { $existingSha = $ex.sha }
+                        } catch {}
+
+                        $bodyObj = @{
+                          message = "Auto-refreshed dead tunnel to $newTunnelUrl"
+                          content = $content
+                          branch  = "${{ github.ref_name }}"
+                        }
+                        if ($existingSha) { $bodyObj["sha"] = $existingSha }
+
+                        Invoke-RestMethod -Method PUT -Uri "https://api.github.com/repos/${{ github.repository }}/contents/$file" -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" } -Body ($bodyObj | ConvertTo-Json -Depth 10) -ContentType "application/json" | Out-Null
+                        Write-Host "  💾 Đã tự động cập nhật link mới vào repo ($file)!"
+                      } catch {
+                        Write-Warning "  Lỗi đẩy link mới lên git: $($_.Exception.Message)"
+                      }
+                    }
+                  }
+                }
+              }
+              Write-Host ""
+            }
+
             $ts = $end - (Get-Date)
             $remaining = if ($ts.TotalSeconds -gt 0) { $ts.ToString('hh\:mm\:ss') } else { '00:00:00' }
-            Write-Host ("$mode Heartbeat #$i " + (Get-Date).ToString('HH:mm:ss') + " | Ends: " + $end.ToString('HH:mm:ss') + " | Remaining: $remaining" + " | Tunnel: $env:TUNNEL_URL")
+            Write-Host ("[Tunnel+RDP] Heartbeat #$i " + (Get-Date).ToString('HH:mm:ss') + " | Left: $remaining | Active Tunnel: $currentTunnelUrl")
             [Console]::Out.Flush()
             Start-Sleep -Seconds 60
           }
-          Write-Host ""
-          Write-Host "========================================"
-          Write-Host "  RUNTIME EXPIRED - SESSION ENDING"
-          Write-Host "========================================"
-          if ($env:TUNNEL_URL) {
-            Write-Host "  Tunnel TCP   : $env:TUNNEL_URL"
-          }
-          Write-Host "  RDP User     : $env:RDP_USER"
-          Write-Host "  RDP Pass     : $env:RDP_PASS"
-          Write-Host "  Hostname     : $env:RDP_HOSTNAME"
-          Write-Host "========================================"
-          Write-Host "Keep alive finished after $i heartbeats."
-          [Console]::Out.Flush()
 
       - name: Dispatch next or stop
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # --- Cleanup: Delete Localtonet tunnel via API ---
           $tunnelId = "$env:LOCALTONET_TUNNEL_ID".Trim()
           $apiKey = "$env:LOCALTONET_API_KEY".Trim()
           if ($tunnelId -and $apiKey) {
-            Write-Host "Cleaning up Localtonet tunnel ID: $tunnelId ..."
             try {
               Invoke-RestMethod -Method DELETE -Uri "https://localtonet.com/api/v2/tunnels/$tunnelId" -Headers @{ Authorization = "Bearer $apiKey" } -TimeoutSec 10 -ErrorAction SilentlyContinue | Out-Null
-              Write-Host "  Tunnel $tunnelId deleted."
-            } catch {
-              Write-Host "  Failed to delete tunnel: $($_.Exception.Message)"
-            }
+            } catch {}
           }
 
-          # --- Kill localtonet process ---
           Get-Process -Name "localtonet" -ErrorAction SilentlyContinue | Stop-Process -Force
 
           $cycles = [int]"${{ inputs.cycles }}"
           if ($cycles -gt 0) {
             $next = $cycles - 1
-            if ($next -le 0) {
-              Write-Host "Last cycle completed. Done."
-            } elseif ($next -gt 0) {
+            if ($next -gt 0) {
               $payload = @{
                 quick_test      = "${{ inputs.quick_test }}"
                 runtime_minutes = "${{ inputs.runtime_minutes }}"
@@ -531,4 +633,4 @@ jobs:
               Invoke-WebRequest -Method POST -Uri $url2 -Headers $hdr2 -Body $body2 | Out-Null
               Write-Host "Dispatched Main Workflow with cycles=$next"
             }
-          } else { Write-Host "No cycles configured. Done." }
+          }
